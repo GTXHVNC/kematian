@@ -259,24 +259,34 @@ jobs:
           }
 
           # Verify the member is encrypted, then test that the requested password
-          # successfully decrypts the archive contents.
-          $listing = & $env:SEVEN_ZIP l -slt $protectedZip 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0) {
-            throw '7-Zip could not inspect the generated ZIP.'
+          # successfully decrypts the archive contents. Normalize CRLF first:
+          # Out-String preserves carriage returns, which can make a strict `$` regex
+          # miss lines such as "Encrypted = +" on Windows even when encryption works.
+          $listingOutput = & $env:SEVEN_ZIP l -slt $protectedZip 2>&1
+          $listingExitCode = $LASTEXITCODE
+          if ($listingExitCode -ne 0) {
+            $listingOutput | ForEach-Object { Write-Host $_ }
+            throw "7-Zip could not inspect the generated ZIP (exit code $listingExitCode)."
           }
+          $listing = ($listingOutput | Out-String) -replace "`r", ''
+
           if ($listing -notmatch '(?m)^Encrypted = \+$') {
             throw 'The output ZIP member is not marked as encrypted; refusing to upload an unprotected archive.'
           }
+          if ($listing -notmatch '(?m)^Method = AES-256(?:\s|$)') {
+            throw 'The output ZIP member is not marked as AES-256 encrypted; refusing to upload it.'
+          }
+
           & $env:SEVEN_ZIP t "-p$($env:KEMATIAN_ZIP_PASSWORD)" $protectedZip
           if ($LASTEXITCODE -ne 0) {
-            throw 'Password-protected ZIP test failed.'
+            throw 'Password-protected ZIP test failed; the requested password may be wrong or the ZIP may be damaged.'
           }
 
           # Ensure the archive member is at the ZIP root and is the DLL we expect.
           if ($listing -notmatch '(?m)^Path = kematian-windows-amd64\.dll$') {
             throw 'The protected ZIP does not contain kematian-windows-amd64.dll at its root.'
           }
-          Write-Host "Verified AES-encrypted output ZIP: $protectedZip"
+          Write-Host "Verified AES-256-encrypted output ZIP: $protectedZip"
 
       - name: Upload password-protected DLL ZIP artifact
         uses: actions/upload-artifact@v7
